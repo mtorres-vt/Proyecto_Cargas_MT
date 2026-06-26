@@ -217,31 +217,38 @@ export const loadValidationData = async (databaseName, tableName) => {
   const isExport = tableName.toLowerCase().includes("exportaciones");
   const monthColumn = isExport ? "MONTH([ASSESSMENT_DATE])" : "TRY_CAST([MONTH] AS INT)";
 
-  const sourceCountResult = await pool.request().query(`
+  const sourceMonthsResult = await pool.request().query(`
     USE ${quoteSqlIdentifier(databaseName)};
-    SELECT COUNT(*) as sourceCount
+    SELECT ${monthColumn} AS DataMonth, COUNT(*) AS TotalRows
     FROM ${quoteSqlIdentifier(tableName)}
-    WHERE ${monthColumn} IS NOT NULL;
+    WHERE ${monthColumn} IS NOT NULL
+    GROUP BY ${monthColumn};
   `);
-  const sourceCount = sourceCountResult.recordset[0].sourceCount;
-
-  const summaryCountResult = await pool
+  
+  const summaryMonthsResult = await pool
     .request()
     .input("tableName", sql.NVarChar, tableName)
     .query(`
       USE ${quoteSqlIdentifier(databaseName)};
-      SELECT ISNULL(SUM(TotalRows), 0) as summaryCount
-      FROM (
-        SELECT DISTINCT DataMonth, TotalRows
-        FROM VRT_ValidationSummary
-        WHERE TableName = @tableName
-      ) t;
+      SELECT DataMonth, MAX(TotalRows) AS TotalRows
+      FROM VRT_ValidationSummary
+      WHERE TableName = @tableName
+      GROUP BY DataMonth;
     `);
-  const summaryCount = summaryCountResult.recordset[0].summaryCount;
 
-  if (sourceCount > 0 && sourceCount === summaryCount) {
-    // TEMPORAL: Comentado para forzar la recarga
-    // return { success: true, alreadyLoaded: true };
+  const sourceMonths = sourceMonthsResult.recordset;
+  const summaryMonths = summaryMonthsResult.recordset;
+
+  const pendingMonths = [];
+  for (const src of sourceMonths) {
+    const sumMatch = summaryMonths.find(sm => sm.DataMonth === src.DataMonth);
+    if (!sumMatch || sumMatch.TotalRows !== src.TotalRows) {
+      pendingMonths.push(src.DataMonth);
+    }
+  }
+
+  if (pendingMonths.length === 0) {
+    return { success: true, alreadyLoaded: true };
   }
 
   const colsResult = await pool
@@ -286,14 +293,18 @@ export const loadValidationData = async (databaseName, tableName) => {
     USE ${quoteSqlIdentifier(databaseName)};
     SELECT ${selectParts.join(", ")}
     FROM ${quoteSqlIdentifier(tableName)}
-    WHERE ${monthColumn} IS NOT NULL
+    WHERE ${monthColumn} IN (${pendingMonths.join(",")})
     GROUP BY ${monthColumn}
   `);
 
   await pool
     .request()
     .input("tableName", sql.NVarChar, tableName)
-    .query(`USE ${quoteSqlIdentifier(databaseName)}; DELETE FROM VRT_ValidationSummary WHERE TableName = @tableName`);
+    .query(`
+      USE ${quoteSqlIdentifier(databaseName)}; 
+      DELETE FROM VRT_ValidationSummary 
+      WHERE TableName = @tableName AND DataMonth IN (${pendingMonths.join(",")})
+    `);
 
   const insertValues = [];
   for (const row of dataResult.recordset) {
